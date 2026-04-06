@@ -5,8 +5,8 @@
 
 .NOTES
     Author          : David Batu
-    LinkedIn        : linkedin.com/in/joshmadakor/
-    GitHub          : github.com/joshmadakor1
+    LinkedIn        : linkedin.com/in/davidbatu/
+    GitHub          : github.com/davidbatudev
     Date Created    : 2026-04-06
     Last Modified   : 2026-04-06
     Version         : 1.0
