@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Tank Arena</title>
+<style>
+  html,body{margin:0;background:#12161a;color:#cfd8dc;font:14px/1.4 system-ui,sans-serif;height:100%}
+  #wrap{display:flex;flex-direction:column;align-items:center;gap:8px;padding:8px}
+  canvas{background:#222;border:2px solid #455a64;max-width:100%;cursor:crosshair}
+  #hud{display:flex;gap:16px;flex-wrap:wrap;justify-content:center}
+  select,button{background:#263238;color:#cfd8dc;border:1px solid #455a64;padding:4px 10px}
+  small{opacity:.7}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="hud">
+    <label>Map <select id="mapSel"></select></label>
+    <button id="restart">Restart</button>
+    <span id="stat"></span>
+  </div>
+  <canvas id="c" width="960" height="640"></canvas>
+  <small>WASD / arrows: drive &nbsp; Mouse: aim &nbsp; Click / Space: fire &nbsp; Kill higher-ranked bots for more XP. Reach General.</small>
+</div>
+<script>
+"use strict";
+const T = 32, COLS = 30, ROWS = 20;
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+
+// ---------- Ranks (bots and player both climb to General) ----------
+const RANKS = ["Private","Private First Class","Corporal","Sergeant","Staff Sergeant",
+  "Lieutenant","Captain","Major","Colonel","Brigadier General","Major General",
+  "Lieutenant General","General"];
+const MAXR = RANKS.length - 1;
+const xpNeeded = r => r === 0 ? 0 : Math.round(30 * r * r + 20 * r);   // cumulative xp for rank r
+const rankColor = r => `hsl(${200 - r * 15},70%,${45 + r * 2}%)`;
+
+// ---------- Original maps, built from rectangle specs ----------
+// '#' steel, 'B' brick (destructible), 'W' water (blocks tanks only)
+const MAPS = {
+  "Crossroads": g => { rect(g,13,0,4,7,'B'); rect(g,13,13,4,7,'B'); rect(g,0,8,7,4,'B'); rect(g,23,8,7,4,'B');
+    rect(g,13,8,4,4,'#'); [[4,3],[25,3],[4,15],[25,15]].forEach(([x,y])=>rect(g,x,y,2,2,'#')); },
+  "Fortress": g => { rect(g,8,4,14,1,'#'); rect(g,8,15,14,1,'#'); rect(g,8,5,1,10,'#'); rect(g,21,5,1,10,'#');
+    rect(g,14,4,2,1,'.'); rect(g,14,15,2,1,'.'); rect(g,8,9,1,2,'.'); rect(g,21,9,1,2,'.');
+    rect(g,11,8,8,4,'B'); rect(g,2,2,3,3,'B'); rect(g,25,2,3,3,'B'); rect(g,2,15,3,3,'B'); rect(g,25,15,3,3,'B'); },
+  "Archipelago": g => { rect(g,6,0,3,9,'W'); rect(g,21,11,3,9,'W'); rect(g,0,9,9,2,'W'); rect(g,21,9,9,2,'W');
+    rect(g,13,3,4,3,'B'); rect(g,13,14,4,3,'B'); rect(g,11,9,8,2,'#'); rect(g,2,3,2,2,'B'); rect(g,26,15,2,2,'B'); },
+};
+function rect(g,x,y,w,h,c){ for(let j=y;j<y+h;j++)for(let i=x;i<x+w;i++) if(g[j]&&i<COLS) g[j][i]=c; }
+function buildMap(name){
+  const g = Array.from({length:ROWS},()=>Array(COLS).fill('.'));
+  for(let i=0;i<COLS;i++){g[0][i]=g[ROWS-1][i]='#';}
+  for(let j=0;j<ROWS;j++){g[j][0]=g[j][COLS-1]='#';}
+  MAPS[name](g);
+  return g;
+}
+
+// ---------- State ----------
+let grid, tanks, bullets, particles, player, keys = {}, mouse = {x:480,y:320,down:false}, mapName, kills = 0, msg = "", msgT = 0;
+
+const sel = document.getElementById('mapSel');
+Object.keys(MAPS).forEach(n => sel.add(new Option(n, n)));
+sel.onchange = () => start(sel.value);
+document.getElementById('restart').onclick = () => start(sel.value);
+
+function stats(rank){ // scales smoothly from Private to General
+  return { hp: 40 + rank*14, speed: 1.3 + rank*0.07, reload: 46 - rank*2.4, dmg: 8 + rank*2.2,
+           bspeed: 5 + rank*0.25, aim: 0.5 + rank*0.04 };
+}
+function solid(x,y,forBullet){
+  const i = Math.floor(x/T), j = Math.floor(y/T);
+  if(i<0||j<0||i>=COLS||j>=ROWS) return '#';
+  const c = grid[j][i];
+  if(c==='W') return forBullet ? false : 'W';
+  return c==='.' ? false : c;
+}
+function freeSpot(){
+  for(let n=0;n<500;n++){
+    const x=(2+Math.random()*(COLS-4))*T, y=(2+Math.random()*(ROWS-4))*T;
+    if(!hitsWall(x,y,12) && tanks.every(t=>!t.alive||Math.hypot(t.x-x,t.y-y)>180)) return {x,y};
+  }
+  return {x:T*2,y:T*2};
+}
+function hitsWall(x,y,r){
+  return [[-r,-r],[r,-r],[-r,r],[r,r]].some(([dx,dy])=>solid(x+dx,y+dy,false));
+}
+function makeTank(rank, isPlayer){
+  const s = stats(rank), p = freeSpot();
+  return { x:p.x, y:p.y, a:Math.random()*6.28, ta:0, rank, isPlayer, hp:s.hp, max:s.hp, cd:0, alive:true,
+           xp: xpNeeded(rank), think:0, goal:null, respawn:0 };
+}
+function start(name){
+  mapName = name; grid = buildMap(name); bullets=[]; particles=[]; tanks=[]; kills=0;
+  player = makeTank(0,true); tanks.push(player);
+  // bots scattered evenly across every rank, Private through General
+  for(let r=0;r<=MAXR;r++){ tanks.push(makeTank(r,false)); if(r%3===0) tanks.push(makeTank(Math.floor(Math.random()*(MAXR+1)),false)); }
+  say("Fight your way up to General");
+}
+function say(t){ msg=t; msgT=180; }
+
+// ---------- Update ----------
+function fire(t){
+  const s = stats(t.rank);
+  if(t.cd>0) return;
+  t.cd = s.reload;
+  bullets.push({x:t.x+Math.cos(t.ta)*20, y:t.y+Math.sin(t.ta)*20, vx:Math.cos(t.ta)*s.bspeed, vy:Math.sin(t.ta)*s.bspeed, dmg:s.dmg, owner:t, life:140});
+}
+function moveTank(t, fwd, turn){
+  const s = stats(t.rank);
+  t.a += turn*0.07;
+  const nx = t.x + Math.cos(t.a)*fwd*s.speed, ny = t.y + Math.sin(t.a)*fwd*s.speed;
+  if(!hitsWall(nx,t.y,12) && !tankBlock(t,nx,t.y)) t.x=nx;
+  if(!hitsWall(t.x,ny,12) && !tankBlock(t,t.x,ny)) t.y=ny;
+}
+function tankBlock(t,x,y){ return tanks.some(o=>o!==t&&o.alive&&Math.hypot(o.x-x,o.y-y)<26); }
+function angDiff(a,b){ let d=b-a; while(d>Math.PI)d-=2*Math.PI; while(d<-Math.PI)d+=2*Math.PI; return d; }
+function lineClear(a,b){
+  const n = Math.ceil(Math.hypot(b.x-a.x,b.y-a.y)/8);
+  for(let i=1;i<n;i++){ if(solid(a.x+(b.x-a.x)*i/n, a.y+(b.y-a.y)*i/n, true)) return false; }
+  return true;
+}
+function botAI(t){
+  const s = stats(t.rank);
+  // target: nearest living tank
+  let tgt=null,bd=1e9;
+  for(const o of tanks) if(o!==t&&o.alive){const d=Math.hypot(o.x-t.x,o.y-t.y); if(d<bd){bd=d;tgt=o;}}
+  if(!tgt) return;
+  const want = Math.atan2(tgt.y-t.y,tgt.x-t.x);
+  t.ta += Math.max(-s.aim*0.1,Math.min(s.aim*0.1,angDiff(t.ta,want)));
+  const visible = lineClear(t,tgt);
+  if(visible && Math.abs(angDiff(t.ta,want))<0.15 && bd<420) fire(t);
+  if(--t.think<=0){
+    t.think = 30+Math.random()*40;
+    t.goal = visible && bd<160 ? want+Math.PI/2*(Math.random()<.5?1:-1) : (visible ? want : want+(Math.random()-.5)*2);
+  }
+  const d = angDiff(t.a,t.goal);
+  moveTank(t, Math.abs(d)<1.2?1:0, Math.max(-1,Math.min(1,d*3)));
+  // stuck: pick a new heading
+  if(hitsWall(t.x+Math.cos(t.a)*16,t.y+Math.sin(t.a)*16,10)) t.goal=t.a+Math.PI*(.5+Math.random());
+}
+function damage(t,amount,by){
+  t.hp-=amount;
+  if(t.hp>0) return;
+  t.alive=false; t.respawn=t.isPlayer?120:240;
+  boom(t.x,t.y,18);
+  if(by && by.alive){
+    const gain = 20 + t.rank*18;
+    by.xp += gain;
+    if(by.isPlayer){ kills++; say(`+${gain} XP  (${RANKS[t.rank]} destroyed)`); }
+    while(by.rank<MAXR && by.xp>=xpNeeded(by.rank+1)){
+      by.rank++; const s=stats(by.rank); by.max=s.hp; by.hp=s.hp;
+      if(by.isPlayer) say(`PROMOTED to ${RANKS[by.rank]}!`);
+    }
+  }
+}
+function boom(x,y,n){ for(let i=0;i<n;i++) particles.push({x,y,vx:(Math.random()-.5)*4,vy:(Math.random()-.5)*4,l:20+Math.random()*20}); }
+
+function update(){
+  // player
+  if(player.alive){
+    const up = keys.w||keys.arrowup, dn = keys.s||keys.arrowdown, lt = keys.a||keys.arrowleft, rt = keys.d||keys.arrowright;
+    moveTank(player, (up?1:0)-(dn?.6:0), (rt?1:0)-(lt?1:0));
+    player.ta = Math.atan2(mouse.y-player.y, mouse.x-player.x);
+    if(mouse.down||keys[' ']) fire(player);
+  }
+  for(const t of tanks){
+    if(t.cd>0) t.cd--;
+    if(!t.alive){
+      if(--t.respawn<=0){ const p=freeSpot(); t.x=p.x;t.y=p.y;t.hp=t.max=stats(t.rank).hp;t.alive=true; if(!t.isPlayer){ t.rank=Math.floor(Math.random()*(MAXR+1)); t.hp=t.max=stats(t.rank).hp; t.xp=xpNeeded(t.rank);} }
+      continue;
+    }
+    if(!t.isPlayer) botAI(t);
+  }
+  for(const b of bullets){
+    b.x+=b.vx; b.y+=b.vy; b.life--;
+    const c = solid(b.x,b.y,true);
+    if(c){ b.life=0; boom(b.x,b.y,4);
+      if(c==='B'){ grid[Math.floor(b.y/T)][Math.floor(b.x/T)]='.'; } }
+    for(const t of tanks) if(t.alive&&t!==b.owner&&Math.hypot(t.x-b.x,t.y-b.y)<14){ b.life=0; boom(b.x,b.y,5); damage(t,b.dmg,b.owner); }
+  }
+  bullets=bullets.filter(b=>b.life>0);
+  for(const p of particles){p.x+=p.vx;p.y+=p.vy;p.l--;}
+  particles=particles.filter(p=>p.l>0);
+  if(msgT>0) msgT--;
+}
+
+// ---------- Drawing (all procedural, original art) ----------
+function drawTile(c,i,j){
+  const x=i*T,y=j*T;
+  if(c==='#'){ ctx.fillStyle='#546e7a'; ctx.fillRect(x,y,T,T); ctx.fillStyle='#78909c'; ctx.fillRect(x+3,y+3,T-6,T-6); ctx.fillStyle='#37474f'; ctx.fillRect(x+T/2-2,y+T/2-2,4,4); }
+  else if(c==='B'){ ctx.fillStyle='#8d4b2f'; ctx.fillRect(x,y,T,T); ctx.fillStyle='#b5683f';
+    for(let r=0;r<4;r++){ const off=r%2?8:0; for(let k=-1;k<3;k++) ctx.fillRect(x+off+k*16+1,y+r*8+1,14,6);} }
+  else if(c==='W'){ ctx.fillStyle='#1e5f8a'; ctx.fillRect(x,y,T,T); ctx.strokeStyle='#4aa3d8'; ctx.beginPath();
+    ctx.moveTo(x+4,y+10);ctx.quadraticCurveTo(x+10,y+4,x+16,y+10);ctx.quadraticCurveTo(x+22,y+16,x+28,y+10);
+    ctx.moveTo(x+4,y+22);ctx.quadraticCurveTo(x+10,y+16,x+16,y+22);ctx.quadraticCurveTo(x+22,y+28,x+28,y+22);ctx.stroke(); }
+  else { ctx.fillStyle=(i+j)%2?'#2d3b2a':'#2a3727'; ctx.fillRect(x,y,T,T); }
+}
+function drawTank(t){
+  if(!t.alive) return;
+  const col = t.isPlayer ? '#4caf50' : rankColor(t.rank);
+  ctx.save(); ctx.translate(t.x,t.y); ctx.rotate(t.a);
+  ctx.fillStyle='#212121'; ctx.fillRect(-14,-13,28,6); ctx.fillRect(-14,7,28,6);        // treads
+  ctx.fillStyle=col; ctx.fillRect(-12,-9,24,18);                                        // hull
+  ctx.restore();
+  ctx.save(); ctx.translate(t.x,t.y); ctx.rotate(t.ta);
+  ctx.fillStyle='#eceff1'; ctx.fillRect(0,-2,20,4);                                     // barrel
+  ctx.fillStyle=col; ctx.beginPath(); ctx.arc(0,0,7,0,6.28); ctx.fill();
+  ctx.strokeStyle='#000'; ctx.lineWidth=1; ctx.stroke();
+  ctx.restore();
+  // rank pips + hp bar
+  ctx.fillStyle='#000a'; ctx.fillRect(t.x-16,t.y-26,32,4);
+  ctx.fillStyle=t.isPlayer?'#66bb6a':'#ef5350'; ctx.fillRect(t.x-16,t.y-26,32*t.hp/t.max,4);
+  ctx.fillStyle='#fff'; ctx.font='10px sans-serif'; ctx.textAlign='center';
+  ctx.fillText(t.isPlayer?'YOU':RANKS[t.rank].replace('General','Gen.').replace('Lieutenant','Lt.').replace('Brigadier','Brig.'),t.x,t.y-30);
+}
+function draw(){
+  for(let j=0;j<ROWS;j++)for(let i=0;i<COLS;i++) drawTile(grid[j][i],i,j);
+  tanks.forEach(drawTank);
+  ctx.fillStyle='#ffd54f'; for(const b of bullets){ctx.beginPath();ctx.arc(b.x,b.y,3,0,6.28);ctx.fill();}
+  ctx.fillStyle='#ffab40'; for(const p of particles){ctx.globalAlpha=p.l/40;ctx.fillRect(p.x,p.y,3,3);} ctx.globalAlpha=1;
+  // HUD
+  const r=player.rank, next=r<MAXR?xpNeeded(r+1):player.xp, base=xpNeeded(r);
+  ctx.fillStyle='#000a'; ctx.fillRect(8,8,260,44);
+  ctx.fillStyle='#fff'; ctx.font='bold 13px sans-serif'; ctx.textAlign='left';
+  ctx.fillText(`${RANKS[r]}   Kills: ${kills}`,16,25);
+  ctx.fillStyle='#37474f'; ctx.fillRect(16,32,244,10);
+  ctx.fillStyle='#ffca28'; ctx.fillRect(16,32,244*(r<MAXR?(player.xp-base)/(next-base):1),10);
+  if(msgT>0){ ctx.globalAlpha=Math.min(1,msgT/40); ctx.fillStyle='#fff'; ctx.font='bold 22px sans-serif'; ctx.textAlign='center'; ctx.fillText(msg,480,60); ctx.globalAlpha=1; }
+  if(!player.alive){ ctx.fillStyle='#fff'; ctx.font='bold 28px sans-serif'; ctx.textAlign='center'; ctx.fillText('Destroyed - respawning...',480,320); }
+  document.getElementById('stat').textContent = `${mapName} · ${tanks.filter(t=>t.alive&&!t.isPlayer).length} bots alive`;
+}
+
+// ---------- Input & loop ----------
+addEventListener('keydown',e=>{keys[e.key.toLowerCase()]=true; if([' ','arrowup','arrowdown'].includes(e.key.toLowerCase()))e.preventDefault();});
+addEventListener('keyup',e=>keys[e.key.toLowerCase()]=false);
+cv.addEventListener('mousemove',e=>{const r=cv.getBoundingClientRect();mouse.x=(e.clientX-r.left)*cv.width/r.width;mouse.y=(e.clientY-r.top)*cv.height/r.height;});
+cv.addEventListener('mousedown',()=>mouse.down=true);
+addEventListener('mouseup',()=>mouse.down=false);
+
+start("Crossroads");
+(function loop(){ update(); draw(); requestAnimationFrame(loop); })();
+</script>
+</body>
+</html>
