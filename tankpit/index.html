@@ -5,241 +5,455 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Tank Arena</title>
 <style>
-  html,body{margin:0;background:#12161a;color:#cfd8dc;font:14px/1.4 system-ui,sans-serif;height:100%}
-  #wrap{display:flex;flex-direction:column;align-items:center;gap:8px;padding:8px}
-  canvas{background:#222;border:2px solid #455a64;max-width:100%;cursor:crosshair}
-  #hud{display:flex;gap:16px;flex-wrap:wrap;justify-content:center}
-  select,button{background:#263238;color:#cfd8dc;border:1px solid #455a64;padding:4px 10px}
-  small{opacity:.7}
+  html,body{margin:0;background:#0d1114;color:#cfd8dc;font:14px/1.4 system-ui,sans-serif;height:100%;overflow:hidden}
+  #wrap{position:relative;width:960px;height:640px;margin:8px auto}
+  canvas{display:block;background:#222;border:2px solid #455a64;cursor:crosshair}
+  #lobby{position:absolute;inset:0;background:#0d1114f2;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;z-index:5}
+  #lobby h1{margin:0;letter-spacing:4px;color:#ffca28}
+  #lobby .row{display:flex;gap:10px;align-items:center}
+  #lobby input,#lobby select,#lobby button{background:#1c262c;color:#cfd8dc;border:1px solid #455a64;padding:6px 10px;font-size:14px}
+  #lobby button.go{background:#2e7d32;font-weight:bold;padding:8px 24px}
+  #tanks{width:520px;max-height:150px;overflow:auto;border:1px solid #37474f;background:#12191d}
+  #tanks div{padding:4px 10px;cursor:pointer;display:flex;justify-content:space-between}
+  #tanks div:hover{background:#263238}
+  #help{width:620px;font-size:12px;opacity:.8;text-align:center}
+  #bar{position:absolute;right:6px;bottom:6px;z-index:2}
+  #bar button{background:#1c262c;color:#cfd8dc;border:1px solid #455a64;padding:3px 8px}
 </style>
 </head>
 <body>
 <div id="wrap">
-  <div id="hud">
-    <label>Map <select id="mapSel"></select></label>
-    <button id="restart">Restart</button>
-    <span id="stat"></span>
-  </div>
   <canvas id="c" width="960" height="640"></canvas>
-  <small>WASD / arrows: drive &nbsp; Mouse: aim &nbsp; Click / Space: fire &nbsp; Kill higher-ranked bots for more XP. Reach General.</small>
+  <div id="bar"><button id="menuBtn">Menu</button></div>
+  <div id="lobby">
+    <h1>TANK ARENA</h1>
+    <div class="row"><input id="name" maxlength="14" placeholder="Tank name" value="Recruit01">
+      <select id="mapSel"></select>
+      <select id="teamSel"><option value="red">Red team</option><option value="blue">Blue team</option></select></div>
+    <div class="row"><small>Your saved tanks (click to load):</small></div>
+    <div id="tanks"></div>
+    <button class="go" id="deploy">DEPLOY</button>
+    <div id="help"><b>How to play</b> &mdash; <b>Left-click</b> the field to drive there (or WASD). Aim with the mouse, fire with <b>Space</b> / <b>right-click</b>.
+      <b>M</b> lay mine &middot; <b>R</b> radar &middot; <b>T</b> teleport (overhead map) &middot; <b>Tab</b> scoreboard.
+      Fuel is your health: moving, shooting, mines, radar, teleporting and hits all burn it. Grab hidden fuel canisters and equipment
+      (cannon, shield, long radar). Ride ferries across water, push crates. Rank from Recruit up to General.</div>
+  </div>
 </div>
 <script>
 "use strict";
-const T = 32, COLS = 30, ROWS = 20;
+const T = 32, COLS = 60, ROWS = 40, VW = 960, VH = 640;
 const cv = document.getElementById('c'), ctx = cv.getContext('2d');
 
-// ---------- Ranks (bots and player both climb to General) ----------
-const RANKS = ["Private","Private First Class","Corporal","Sergeant","Staff Sergeant",
-  "Lieutenant","Captain","Major","Colonel","Brigadier General","Major General",
-  "Lieutenant General","General"];
+// ---------- Ranks: Recruit ... General ----------
+const RANKS = ["Recruit","Private","Private First Class","Corporal","Sergeant","Staff Sergeant","Lieutenant",
+  "Captain","Major","Colonel","Brigadier General","Major General","Lieutenant General","General"];
 const MAXR = RANKS.length - 1;
-const xpNeeded = r => r === 0 ? 0 : Math.round(30 * r * r + 20 * r);   // cumulative xp for rank r
-const rankColor = r => `hsl(${200 - r * 15},70%,${45 + r * 2}%)`;
+const xpNeeded = r => r <= 0 ? 0 : 40*r*r + 30*r;
+const rankOf = xp => { let r = 0; while (r < MAXR && xp >= xpNeeded(r+1)) r++; return r; };
+const short = r => RANKS[r].replace("Private First Class","PFC").replace("Staff Sergeant","SSgt").replace("Lieutenant General","Lt Gen")
+  .replace("Brigadier General","Brig Gen").replace("Major General","Maj Gen").replace("Lieutenant","Lt").replace("Sergeant","Sgt").replace("Corporal","Cpl");
+const TEAM = { red:{c:'#e53935',d:'#8e1c1a'}, blue:{c:'#1e88e5',d:'#0d4a85'} };
+const CALLS = ["Viper","Anvil","Ghost","Rhino","Falcon","Bishop","Cobra","Nomad","Tundra","Havoc","Mantis","Dagger","Pilot","Atlas","Bruno","Echo","Fang","Gizmo","Hammer","Iron","Jinx","Kodiak","Lancer","Maverick"];
 
-// ---------- Original maps, built from rectangle specs ----------
-// '#' steel, 'B' brick (destructible), 'W' water (blocks tanks only)
+// ---------- Original maps (left half is authored, right half is mirrored) ----------
+function rect(g,x,y,w,h,c){ for(let j=y;j<y+h;j++)for(let i=x;i<x+w;i++) if(g[j]&&i>=0&&i<COLS) g[j][i]=c; }
+function box(g,x,y,w,h,c){ rect(g,x,y,w,1,c);rect(g,x,y+h-1,w,1,c);rect(g,x,y,1,h,c);rect(g,x+w-1,y,1,h,c); }
 const MAPS = {
-  "Crossroads": g => { rect(g,13,0,4,7,'B'); rect(g,13,13,4,7,'B'); rect(g,0,8,7,4,'B'); rect(g,23,8,7,4,'B');
-    rect(g,13,8,4,4,'#'); [[4,3],[25,3],[4,15],[25,15]].forEach(([x,y])=>rect(g,x,y,2,2,'#')); },
-  "Fortress": g => { rect(g,8,4,14,1,'#'); rect(g,8,15,14,1,'#'); rect(g,8,5,1,10,'#'); rect(g,21,5,1,10,'#');
-    rect(g,14,4,2,1,'.'); rect(g,14,15,2,1,'.'); rect(g,8,9,1,2,'.'); rect(g,21,9,1,2,'.');
-    rect(g,11,8,8,4,'B'); rect(g,2,2,3,3,'B'); rect(g,25,2,3,3,'B'); rect(g,2,15,3,3,'B'); rect(g,25,15,3,3,'B'); },
-  "Archipelago": g => { rect(g,6,0,3,9,'W'); rect(g,21,11,3,9,'W'); rect(g,0,9,9,2,'W'); rect(g,21,9,9,2,'W');
-    rect(g,13,3,4,3,'B'); rect(g,13,14,4,3,'B'); rect(g,11,9,8,2,'#'); rect(g,2,3,2,2,'B'); rect(g,26,15,2,2,'B'); },
+  "Iron Valley": { floor:['#2b3a28','#283524'], build(g,cr){
+      rect(g,26,1,8,38,'W');
+      box(g,6,6,10,8,'#'); rect(g,10,6,2,1,'.'); rect(g,6,9,1,2,'.'); rect(g,10,13,2,1,'.');
+      box(g,6,26,10,8,'#'); rect(g,10,26,2,1,'.'); rect(g,6,29,1,2,'.'); rect(g,10,33,2,1,'.');
+      rect(g,18,17,4,6,'B'); rect(g,12,18,3,4,'B'); rect(g,20,3,3,3,'B'); rect(g,20,34,3,3,'B');
+      [[9,19],[16,10],[16,29],[23,12],[23,28],[3,20]].forEach(p=>cr(p[0],p[1]));
+    }, ferries:[{y:8},{y:19},{y:30}] },
+  "Delta Lakes": { floor:['#3a3a28','#363624'], build(g,cr){
+      rect(g,27,1,6,14,'W'); rect(g,27,25,6,14,'W'); rect(g,27,15,6,10,'.');
+      rect(g,27,17,6,1,'#'); rect(g,27,22,6,1,'#'); rect(g,29,17,2,1,'B'); rect(g,29,22,2,1,'B');
+      rect(g,9,8,7,5,'W'); rect(g,9,27,7,5,'W'); rect(g,14,17,3,6,'B'); rect(g,5,16,2,8,'#');
+      rect(g,20,3,2,6,'#'); rect(g,20,31,2,6,'#'); rect(g,22,19,3,2,'B');
+      [[11,16],[11,23],[18,12],[18,27],[4,10],[4,30],[24,10],[24,30]].forEach(p=>cr(p[0],p[1]));
+    }, ferries:[{y:6},{y:33}] },
+  "Bunker Hill": { floor:['#33302a','#2f2c26'], build(g,cr){
+      box(g,18,8,24,24,'#'); rect(g,28,8,4,1,'.'); rect(g,28,31,4,1,'.'); rect(g,18,18,1,4,'.'); rect(g,41,18,1,4,'.');
+      box(g,23,13,14,14,'B'); rect(g,28,13,4,1,'.'); rect(g,28,26,4,1,'.'); rect(g,23,18,1,4,'.'); rect(g,36,18,1,4,'.');
+      rect(g,29,19,2,2,'#'); rect(g,4,4,4,4,'W'); rect(g,4,32,4,4,'W'); rect(g,10,18,3,4,'B'); rect(g,2,17,2,6,'#');
+      [[14,10],[14,29],[8,15],[8,24],[20,5],[20,34],[26,4],[26,35]].forEach(p=>cr(p[0],p[1]));
+    }, ferries:[] },
 };
-function rect(g,x,y,w,h,c){ for(let j=y;j<y+h;j++)for(let i=x;i<x+w;i++) if(g[j]&&i<COLS) g[j][i]=c; }
+let grid, crates, ferries, mines, pickups, tanks, bullets, parts, rings, player, frame, keys, mouse, camX, camY, mapName, mapDef;
+let msgs = [], teleOpen = false, running = false, score = {red:0,blue:0};
+keys = {}; mouse = {x:480,y:320,down:false};
+
 function buildMap(name){
-  const g = Array.from({length:ROWS},()=>Array(COLS).fill('.'));
-  for(let i=0;i<COLS;i++){g[0][i]=g[ROWS-1][i]='#';}
-  for(let j=0;j<ROWS;j++){g[j][0]=g[j][COLS-1]='#';}
-  MAPS[name](g);
-  return g;
+  mapDef = MAPS[name];
+  grid = Array.from({length:ROWS},()=>Array(COLS).fill('.'));
+  crates = [];
+  const cr = (x,y)=>{ crates.push({x:x*T+16,y:y*T+16}); crates.push({x:(COLS-1-x)*T+16,y:y*T+16}); };
+  mapDef.build(grid,cr);
+  for(let j=0;j<ROWS;j++)for(let i=0;i<COLS/2;i++) grid[j][COLS-1-i]=grid[j][i];   // mirror
+  box(grid,0,0,COLS,ROWS,'#');
+  ferries = mapDef.ferries.map(f=>({x:26*T,y:f.y*T,w:2*T,h:2*T,x0:26*T,x1:32*T,dir:1,wait:0}));
+  crates = crates.filter(c=>{ const i=c.x/T|0,j=c.y/T|0; return grid[j][i]==='.'; });
 }
 
-// ---------- State ----------
-let grid, tanks, bullets, particles, player, keys = {}, mouse = {x:480,y:320,down:false}, mapName, kills = 0, msg = "", msgT = 0;
-
-const sel = document.getElementById('mapSel');
-Object.keys(MAPS).forEach(n => sel.add(new Option(n, n)));
-sel.onchange = () => start(sel.value);
-document.getElementById('restart').onclick = () => start(sel.value);
-
-function stats(rank){ // scales smoothly from Private to General
-  return { hp: 40 + rank*14, speed: 1.3 + rank*0.07, reload: 46 - rank*2.4, dmg: 8 + rank*2.2,
-           bspeed: 5 + rank*0.25, aim: 0.5 + rank*0.04 };
-}
-function solid(x,y,forBullet){
-  const i = Math.floor(x/T), j = Math.floor(y/T);
+// ---------- Rules / stats ----------
+function stats(r){ return { speed:1.5+r*0.06, reload:34-r*1.2, dmg:9+r*0.9, bspeed:7, maxFuel:100+r*8 }; }
+function onFerry(x,y){ return ferries.some(f=>x>=f.x&&x<f.x+f.w&&y>=f.y&&y<f.y+f.h); }
+function solid(x,y,bullet){
+  const i=Math.floor(x/T), j=Math.floor(y/T);
   if(i<0||j<0||i>=COLS||j>=ROWS) return '#';
-  const c = grid[j][i];
-  if(c==='W') return forBullet ? false : 'W';
-  return c==='.' ? false : c;
+  const c=grid[j][i];
+  if(c==='.') return false;
+  if(c==='W') return bullet ? false : (onFerry(x,y) ? false : 'W');
+  return c;
 }
-function freeSpot(){
-  for(let n=0;n<500;n++){
-    const x=(2+Math.random()*(COLS-4))*T, y=(2+Math.random()*(ROWS-4))*T;
-    if(!hitsWall(x,y,12) && tanks.every(t=>!t.alive||Math.hypot(t.x-x,t.y-y)>180)) return {x,y};
+function hitsWall(x,y,r){ return [[-r,-r],[r,-r],[-r,r],[r,r]].some(d=>solid(x+d[0],y+d[1],false)); }
+function crateAt(x,y,self,r){ return crates.find(c=>c!==self && Math.abs(c.x-x)<r && Math.abs(c.y-y)<r); }
+function tankNear(x,y,self,d){ return tanks.some(o=>o!==self&&o.alive&&Math.hypot(o.x-x,o.y-y)<d); }
+function freeSpot(team){
+  for(let n=0;n<800;n++){
+    let x,y;
+    if(team){ const tx=team==='red'?2+Math.random()*8:50+Math.random()*8; x=tx*T; y=(2+Math.random()*36)*T; }
+    else { x=(2+Math.random()*56)*T; y=(2+Math.random()*36)*T; }
+    if(!hitsWall(x,y,14) && !onFerry(x,y) && !crateAt(x,y,null,30) && !tankNear(x,y,null,90)) return {x,y};
   }
-  return {x:T*2,y:T*2};
+  return {x:3*T,y:3*T};
 }
-function hitsWall(x,y,r){
-  return [[-r,-r],[r,-r],[-r,r],[r,r]].some(([dx,dy])=>solid(x+dx,y+dy,false));
-}
-function makeTank(rank, isPlayer){
-  const s = stats(rank), p = freeSpot();
-  return { x:p.x, y:p.y, a:Math.random()*6.28, ta:0, rank, isPlayer, hp:s.hp, max:s.hp, cd:0, alive:true,
-           xp: xpNeeded(rank), think:0, goal:null, respawn:0 };
-}
-function start(name){
-  mapName = name; grid = buildMap(name); bullets=[]; particles=[]; tanks=[]; kills=0;
-  player = makeTank(0,true); tanks.push(player);
-  // bots scattered evenly across every rank, Private through General
-  for(let r=0;r<=MAXR;r++){ tanks.push(makeTank(r,false)); if(r%3===0) tanks.push(makeTank(Math.floor(Math.random()*(MAXR+1)),false)); }
-  say("Fight your way up to General");
-}
-function say(t){ msg=t; msgT=180; }
+function say(t,c){ msgs.push({t,c:c||'#fff',l:300}); if(msgs.length>5) msgs.shift(); }
 
-// ---------- Update ----------
+// ---------- Tanks ----------
+function makeTank(name,team,rank,isPlayer,xp){
+  const p=freeSpot(team), s=stats(rank);
+  return { name,team,rank,isPlayer,xp:xp!=null?xp:xpNeeded(rank),x:p.x,y:p.y,a:Math.random()*6.28,ta:0,fuel:s.maxFuel,cd:0,alive:true,
+    respawn:0,eq:{cannon:false,shield:0,radar:false},kills:0,deaths:0,dest:null,tp:0,rc:0,think:0,goal:0,moving:false,wander:null };
+}
+function useFuel(t,n,by){ t.fuel-=n; if(t.fuel<=0) kill(t,by); }
+function addXp(t,n){
+  t.xp+=n; let up=false;
+  while(t.rank<MAXR && t.xp>=xpNeeded(t.rank+1)){ t.rank++; up=true; }
+  if(up){ t.fuel=stats(t.rank).maxFuel; if(t.isPlayer) say(`PROMOTED to ${RANKS[t.rank]}!`,'#ffca28'); }
+}
+function kill(t,by){
+  if(!t.alive) return;
+  t.alive=false; t.fuel=0; t.respawn=240; t.deaths++; t.dest=null;
+  boom(t.x,t.y,26);
+  const drops=[]; if(t.eq.cannon) drops.push('cannon'); if(t.eq.shield>0) drops.push('shield'); if(t.eq.radar) drops.push('radar');
+  if(drops.length || Math.random()<.5) pickups.push({x:t.x,y:t.y,type:drops.length?drops[Math.random()*drops.length|0]:'fuel',rev:0});
+  t.eq={cannon:false,shield:0,radar:false};
+  if(by && by.team!==t.team){
+    by.kills++; score[by.team]++; addXp(by,25+t.rank*15);
+    by.fuel=Math.min(stats(by.rank).maxFuel,by.fuel+15);
+    if(by.isPlayer) say(`Destroyed ${t.name} (${RANKS[t.rank]})  +${25+t.rank*15} XP`,'#a5d6a7');
+  }
+  if(t.isPlayer){ say(by?`Destroyed by ${by.name}`:'Out of fuel!','#ef9a9a'); save(); }
+}
+function respawn(t){
+  const p=freeSpot(t.team); t.x=p.x; t.y=p.y; t.alive=true;
+  if(!t.isPlayer){ t.rank=Math.random()*(MAXR+1)|0; t.xp=xpNeeded(t.rank); }
+  t.fuel=stats(t.rank).maxFuel*.8; t.cd=0; t.tp=0;
+}
+
 function fire(t){
-  const s = stats(t.rank);
-  if(t.cd>0) return;
-  t.cd = s.reload;
-  bullets.push({x:t.x+Math.cos(t.ta)*20, y:t.y+Math.sin(t.ta)*20, vx:Math.cos(t.ta)*s.bspeed, vy:Math.sin(t.ta)*s.bspeed, dmg:s.dmg, owner:t, life:140});
+  if(t.cd>0||t.fuel<3) return;
+  const s=stats(t.rank), big=t.eq.cannon;
+  t.cd=s.reload*(big?1.5:1); useFuel(t,big?4:2,null);
+  bullets.push({x:t.x+Math.cos(t.ta)*20,y:t.y+Math.sin(t.ta)*20,vx:Math.cos(t.ta)*s.bspeed,vy:Math.sin(t.ta)*s.bspeed,
+    dmg:s.dmg*(big?1.9:1),owner:t,team:t.team,life:95,big});
 }
-function moveTank(t, fwd, turn){
-  const s = stats(t.rank);
-  t.a += turn*0.07;
-  const nx = t.x + Math.cos(t.a)*fwd*s.speed, ny = t.y + Math.sin(t.a)*fwd*s.speed;
-  if(!hitsWall(nx,t.y,12) && !tankBlock(t,nx,t.y)) t.x=nx;
-  if(!hitsWall(t.x,ny,12) && !tankBlock(t,t.x,ny)) t.y=ny;
+function hit(t,dmg,by){
+  if(t.eq.shield>0){ const a=Math.min(t.eq.shield,dmg); t.eq.shield-=a; dmg-=a; }
+  if(dmg>0) useFuel(t,dmg,by);
 }
-function tankBlock(t,x,y){ return tanks.some(o=>o!==t&&o.alive&&Math.hypot(o.x-x,o.y-y)<26); }
+function layMine(t){ if(t.fuel<14) return; useFuel(t,10,null); mines.push({x:t.x,y:t.y,team:t.team,owner:t,rev:0}); if(t.isPlayer) say('Mine laid'); }
+function radar(t){
+  if(t.rc>0||t.fuel<12) return; t.rc=180; useFuel(t,8,null);
+  const R=t.eq.radar?560:320; rings.push({x:t.x,y:t.y,r:0,R,team:t.team});
+  pickups.forEach(p=>{ if(Math.hypot(p.x-t.x,p.y-t.y)<R) p.rev=frame+400; });
+  mines.forEach(m=>{ if(m.team!==t.team&&Math.hypot(m.x-t.x,m.y-t.y)<R) m.rev=frame+400; });
+}
+
+function moveTank(t,fwd,turn){
+  const s=stats(t.rank);
+  t.a+=turn*0.08;
+  if(!fwd){ t.moving=false; return; }
+  const dx=Math.cos(t.a)*fwd*s.speed, dy=Math.sin(t.a)*fwd*s.speed;
+  const a=step(t,dx,0), b=step(t,0,dy);
+  t.moving=a||b;
+  if(t.moving) useFuel(t,0.012,null);
+}
+function step(t,dx,dy){
+  const nx=t.x+dx, ny=t.y+dy;
+  if(hitsWall(nx,ny,12)||tankNear(nx,ny,t,26)) return false;
+  const hits=crates.filter(c=>Math.abs(c.x-nx)<26&&Math.abs(c.y-ny)<26);
+  for(const c of hits){
+    const cx=c.x+dx, cy=c.y+dy;
+    if(hitsWall(cx,cy,14)||crateAt(cx,cy,c,28)||tankNear(cx,cy,t,27)) return false;
+  }
+  hits.forEach(c=>{c.x+=dx;c.y+=dy;});
+  t.x=nx; t.y=ny; return true;
+}
 function angDiff(a,b){ let d=b-a; while(d>Math.PI)d-=2*Math.PI; while(d<-Math.PI)d+=2*Math.PI; return d; }
 function lineClear(a,b){
-  const n = Math.ceil(Math.hypot(b.x-a.x,b.y-a.y)/8);
-  for(let i=1;i<n;i++){ if(solid(a.x+(b.x-a.x)*i/n, a.y+(b.y-a.y)*i/n, true)) return false; }
+  const n=Math.ceil(Math.hypot(b.x-a.x,b.y-a.y)/10);
+  for(let i=1;i<n;i++){ const x=a.x+(b.x-a.x)*i/n,y=a.y+(b.y-a.y)*i/n; if(solid(x,y,true)||crateAt(x,y,null,14)) return false; }
   return true;
 }
-function botAI(t){
-  const s = stats(t.rank);
-  // target: nearest living tank
-  let tgt=null,bd=1e9;
-  for(const o of tanks) if(o!==t&&o.alive){const d=Math.hypot(o.x-t.x,o.y-t.y); if(d<bd){bd=d;tgt=o;}}
-  if(!tgt) return;
-  const want = Math.atan2(tgt.y-t.y,tgt.x-t.x);
-  t.ta += Math.max(-s.aim*0.1,Math.min(s.aim*0.1,angDiff(t.ta,want)));
-  const visible = lineClear(t,tgt);
-  if(visible && Math.abs(angDiff(t.ta,want))<0.15 && bd<420) fire(t);
-  if(--t.think<=0){
-    t.think = 30+Math.random()*40;
-    t.goal = visible && bd<160 ? want+Math.PI/2*(Math.random()<.5?1:-1) : (visible ? want : want+(Math.random()-.5)*2);
-  }
-  const d = angDiff(t.a,t.goal);
-  moveTank(t, Math.abs(d)<1.2?1:0, Math.max(-1,Math.min(1,d*3)));
-  // stuck: pick a new heading
-  if(hitsWall(t.x+Math.cos(t.a)*16,t.y+Math.sin(t.a)*16,10)) t.goal=t.a+Math.PI*(.5+Math.random());
-}
-function damage(t,amount,by){
-  t.hp-=amount;
-  if(t.hp>0) return;
-  t.alive=false; t.respawn=t.isPlayer?120:240;
-  boom(t.x,t.y,18);
-  if(by && by.alive){
-    const gain = 20 + t.rank*18;
-    by.xp += gain;
-    if(by.isPlayer){ kills++; say(`+${gain} XP  (${RANKS[t.rank]} destroyed)`); }
-    while(by.rank<MAXR && by.xp>=xpNeeded(by.rank+1)){
-      by.rank++; const s=stats(by.rank); by.max=s.hp; by.hp=s.hp;
-      if(by.isPlayer) say(`PROMOTED to ${RANKS[by.rank]}!`);
-    }
-  }
-}
-function boom(x,y,n){ for(let i=0;i<n;i++) particles.push({x,y,vx:(Math.random()-.5)*4,vy:(Math.random()-.5)*4,l:20+Math.random()*20}); }
 
+function botAI(t){
+  const s=stats(t.rank);
+  let tgt=null,bd=1e9;
+  for(const o of tanks) if(o.alive&&o.team!==t.team){ const d=Math.hypot(o.x-t.x,o.y-t.y); if(d<bd){bd=d;tgt=o;} }
+  let vis=false;
+  if(tgt&&bd<520){ vis=lineClear(t,tgt); }
+  const want=tgt?Math.atan2(tgt.y-t.y,tgt.x-t.x):t.a;
+  const lead=0.045+t.rank*0.004;
+  t.ta+=Math.max(-lead*2,Math.min(lead*2,angDiff(t.ta,vis?want:t.a)));
+  if(vis&&Math.abs(angDiff(t.ta,want))<0.12&&bd<430) fire(t);
+  if(t.rank>=3&&t.cd===0&&Math.random()<.0006&&t.fuel>60) layMine(t);
+  if(--t.think<=0){
+    t.think=25+Math.random()*40;
+    let goal=null;
+    const low=t.fuel<stats(t.rank).maxFuel*.5;
+    if(low){ let bp=null,pd=700; for(const p of pickups){ if(p.type!=='fuel') continue; const d=Math.hypot(p.x-t.x,p.y-t.y); if(d<pd){pd=d;bp=p;} } if(bp) goal=Math.atan2(bp.y-t.y,bp.x-t.x); }
+    if(goal==null && !low){ for(const p of pickups){ if(p.type!=='fuel' && Math.hypot(p.x-t.x,p.y-t.y)<300){ goal=Math.atan2(p.y-t.y,p.x-t.x); break; } } }
+    if(goal==null){
+      if(vis) goal=bd<150?want+(Math.random()<.5?1:-1)*1.5:want+(Math.random()-.5)*.6;
+      else { if(!t.wander||Math.hypot(t.wander.x-t.x,t.wander.y-t.y)<80||Math.random()<.15){ const e=tgt||{x:COLS*T/2,y:ROWS*T/2}; t.wander={x:e.x+(Math.random()-.5)*500,y:e.y+(Math.random()-.5)*400}; }
+        goal=Math.atan2(t.wander.y-t.y,t.wander.x-t.x); }
+    }
+    t.goal=goal;
+  }
+  const d=angDiff(t.a,t.goal);
+  moveTank(t,Math.abs(d)<1.3?1:0,Math.max(-1,Math.min(1,d*3)));
+  if(!t.moving&&Math.abs(d)<1.3) t.goal=t.a+Math.PI*(.6+Math.random()*.8);
+  if(s.speed && hitsWall(t.x+Math.cos(t.a)*20,t.y+Math.sin(t.a)*20,10)) t.goal=t.a+(Math.random()<.5?1:-1)*(1+Math.random());
+}
+
+function boom(x,y,n){ for(let i=0;i<n;i++) parts.push({x,y,vx:(Math.random()-.5)*5,vy:(Math.random()-.5)*5,l:15+Math.random()*25}); }
+
+// ---------- Update ----------
 function update(){
-  // player
-  if(player.alive){
-    const up = keys.w||keys.arrowup, dn = keys.s||keys.arrowdown, lt = keys.a||keys.arrowleft, rt = keys.d||keys.arrowright;
-    moveTank(player, (up?1:0)-(dn?.6:0), (rt?1:0)-(lt?1:0));
-    player.ta = Math.atan2(mouse.y-player.y, mouse.x-player.x);
-    if(mouse.down||keys[' ']) fire(player);
+  frame++;
+  for(const f of ferries){
+    if(f.wait>0){f.wait--;continue;}
+    const dx=f.dir*0.9; f.x+=dx;
+    tanks.forEach(t=>{ if(t.alive&&t.x>=f.x-dx&&t.x<f.x+f.w-dx&&t.y>=f.y&&t.y<f.y+f.h) t.x+=dx; });
+    crates.forEach(c=>{ if(c.x>=f.x-dx&&c.x<f.x+f.w-dx&&c.y>=f.y&&c.y<f.y+f.h) c.x+=dx; });
+    if(f.x>=f.x1){f.x=f.x1;f.dir=-1;f.wait=150;} if(f.x<=f.x0){f.x=f.x0;f.dir=1;f.wait=150;}
+  }
+  const p=player;
+  if(p.alive&&!teleOpen){
+    const up=keys.w||keys.arrowup, dn=keys.s||keys.arrowdown, lt=keys.a||keys.arrowleft, rt=keys.d||keys.arrowright;
+    p.ta=Math.atan2(mouse.y+camY-p.y,mouse.x+camX-p.x);
+    if(up||dn||lt||rt){ p.dest=null; moveTank(p,(up?1:0)-(dn?.6:0),(rt?1:0)-(lt?1:0)); }
+    else if(p.dest){
+      const d=Math.hypot(p.dest.x-p.x,p.dest.y-p.y);
+      if(d<10) p.dest=null; else { const df=angDiff(p.a,Math.atan2(p.dest.y-p.y,p.dest.x-p.x)); moveTank(p,Math.abs(df)<1.2?1:0,Math.max(-1,Math.min(1,df*3)));
+        if(!p.moving&&Math.abs(df)<1.2&&++p.stuck>40){p.dest=null;} if(p.moving)p.stuck=0; }
+    } else p.moving=false;
+    if(keys[' ']||mouse.rdown) fire(p);
   }
   for(const t of tanks){
-    if(t.cd>0) t.cd--;
-    if(!t.alive){
-      if(--t.respawn<=0){ const p=freeSpot(); t.x=p.x;t.y=p.y;t.hp=t.max=stats(t.rank).hp;t.alive=true; if(!t.isPlayer){ t.rank=Math.floor(Math.random()*(MAXR+1)); t.hp=t.max=stats(t.rank).hp; t.xp=xpNeeded(t.rank);} }
-      continue;
-    }
+    if(t.cd>0)t.cd--; if(t.rc>0)t.rc--; if(t.tp>0)t.tp--;
+    if(!t.alive){ if(--t.respawn<=0) respawn(t); continue; }
     if(!t.isPlayer) botAI(t);
+    for(let i=pickups.length-1;i>=0;i--){ const k=pickups[i];
+      if(Math.hypot(k.x-t.x,k.y-t.y)<20){
+        if(k.type==='fuel'){ if(t.fuel>=stats(t.rank).maxFuel-1&&!t.isPlayer) continue; t.fuel=Math.min(stats(t.rank).maxFuel,t.fuel+40); }
+        else if(k.type==='cannon') t.eq.cannon=true;
+        else if(k.type==='shield') t.eq.shield=60;
+        else if(k.type==='radar') t.eq.radar=true;
+        if(t.isPlayer&&k.type!=='fuel') say(`Picked up ${k.type}`,'#ffe082');
+        pickups.splice(i,1);
+      }
+    }
+    for(let i=mines.length-1;i>=0;i--){ const m=mines[i];
+      if(m.team!==t.team&&Math.hypot(m.x-t.x,m.y-t.y)<16){ mines.splice(i,1); boom(m.x,m.y,20); hit(t,38,m.owner); }
+    }
   }
   for(const b of bullets){
     b.x+=b.vx; b.y+=b.vy; b.life--;
-    const c = solid(b.x,b.y,true);
-    if(c){ b.life=0; boom(b.x,b.y,4);
-      if(c==='B'){ grid[Math.floor(b.y/T)][Math.floor(b.x/T)]='.'; } }
-    for(const t of tanks) if(t.alive&&t!==b.owner&&Math.hypot(t.x-b.x,t.y-b.y)<14){ b.life=0; boom(b.x,b.y,5); damage(t,b.dmg,b.owner); }
+    const c=solid(b.x,b.y,true);
+    if(c){ b.life=0; boom(b.x,b.y,4); if(c==='B') grid[Math.floor(b.y/T)][Math.floor(b.x/T)]='.'; }
+    else if(crateAt(b.x,b.y,null,15)){ b.life=0; boom(b.x,b.y,3); }
+    for(const t of tanks) if(t.alive&&t.team!==b.team&&Math.hypot(t.x-b.x,t.y-b.y)<15){
+      b.life=0; boom(b.x,b.y,6); hit(t,b.dmg,b.owner); if(b.owner.alive||true) addXp(b.owner,1+t.rank*.5);
+    }
   }
   bullets=bullets.filter(b=>b.life>0);
-  for(const p of particles){p.x+=p.vx;p.y+=p.vy;p.l--;}
-  particles=particles.filter(p=>p.l>0);
-  if(msgT>0) msgT--;
+  for(const q of parts){q.x+=q.vx;q.y+=q.vy;q.l--;} parts=parts.filter(q=>q.l>0);
+  for(const r of rings) r.r+=6; rings=rings.filter(r=>r.r<r.R);
+  msgs.forEach(m=>m.l--); msgs=msgs.filter(m=>m.l>0);
+  // keep the field stocked with hidden fuel / gear
+  if(frame%240===0){
+    const fuelN=pickups.filter(k=>k.type==='fuel').length;
+    if(fuelN<22){ const s=freeSpot(); pickups.push({x:s.x,y:s.y,type:'fuel',rev:0}); }
+    if(frame%960===0&&pickups.filter(k=>k.type!=='fuel').length<6){ const s=freeSpot(); pickups.push({x:s.x,y:s.y,type:['cannon','shield','radar'][Math.random()*3|0],rev:0}); }
+  }
+  if(frame%300===0) save();
+  camX=Math.max(0,Math.min(COLS*T-VW,p.x-VW/2)); camY=Math.max(0,Math.min(ROWS*T-VH,p.y-VH/2));
 }
 
-// ---------- Drawing (all procedural, original art) ----------
+// ---------- Drawing (procedural, original art) ----------
 function drawTile(c,i,j){
-  const x=i*T,y=j*T;
-  if(c==='#'){ ctx.fillStyle='#546e7a'; ctx.fillRect(x,y,T,T); ctx.fillStyle='#78909c'; ctx.fillRect(x+3,y+3,T-6,T-6); ctx.fillStyle='#37474f'; ctx.fillRect(x+T/2-2,y+T/2-2,4,4); }
-  else if(c==='B'){ ctx.fillStyle='#8d4b2f'; ctx.fillRect(x,y,T,T); ctx.fillStyle='#b5683f';
-    for(let r=0;r<4;r++){ const off=r%2?8:0; for(let k=-1;k<3;k++) ctx.fillRect(x+off+k*16+1,y+r*8+1,14,6);} }
-  else if(c==='W'){ ctx.fillStyle='#1e5f8a'; ctx.fillRect(x,y,T,T); ctx.strokeStyle='#4aa3d8'; ctx.beginPath();
-    ctx.moveTo(x+4,y+10);ctx.quadraticCurveTo(x+10,y+4,x+16,y+10);ctx.quadraticCurveTo(x+22,y+16,x+28,y+10);
-    ctx.moveTo(x+4,y+22);ctx.quadraticCurveTo(x+10,y+16,x+16,y+22);ctx.quadraticCurveTo(x+22,y+28,x+28,y+22);ctx.stroke(); }
-  else { ctx.fillStyle=(i+j)%2?'#2d3b2a':'#2a3727'; ctx.fillRect(x,y,T,T); }
+  const x=i*T-camX,y=j*T-camY;
+  if(c==='#'){ ctx.fillStyle='#4f656f'; ctx.fillRect(x,y,T,T); ctx.fillStyle='#7b929c'; ctx.fillRect(x+3,y+3,T-6,T-6); ctx.fillStyle='#34454c'; ctx.fillRect(x+13,y+13,6,6); }
+  else if(c==='B'){ ctx.fillStyle='#7a3f26'; ctx.fillRect(x,y,T,T); ctx.fillStyle='#b5683f'; for(let r=0;r<4;r++){const o=r%2?8:0;for(let k=-1;k<3;k++)ctx.fillRect(x+o+k*16+1,y+r*8+1,14,6);} }
+  else if(c==='W'){ ctx.fillStyle='#1b5a85'; ctx.fillRect(x,y,T,T); ctx.strokeStyle='#4aa3d8'; ctx.beginPath(); const o=(frame>>3)%16;
+    ctx.moveTo(x+2,y+10);ctx.quadraticCurveTo(x+9,y+4,x+16,y+10);ctx.quadraticCurveTo(x+23,y+16,x+30,y+10);
+    ctx.moveTo(x+2,y+24);ctx.quadraticCurveTo(x+9,y+18,x+16,y+24);ctx.quadraticCurveTo(x+23,y+30,x+30,y+24);ctx.stroke(); }
+  else { ctx.fillStyle=mapDef.floor[(i+j)&1]; ctx.fillRect(x,y,T,T); }
 }
 function drawTank(t){
   if(!t.alive) return;
-  const col = t.isPlayer ? '#4caf50' : rankColor(t.rank);
-  ctx.save(); ctx.translate(t.x,t.y); ctx.rotate(t.a);
-  ctx.fillStyle='#212121'; ctx.fillRect(-14,-13,28,6); ctx.fillRect(-14,7,28,6);        // treads
-  ctx.fillStyle=col; ctx.fillRect(-12,-9,24,18);                                        // hull
+  const x=t.x-camX,y=t.y-camY; if(x<-40||y<-40||x>VW+40||y>VH+40) return;
+  const col=TEAM[t.team];
+  ctx.save(); ctx.translate(x,y); ctx.rotate(t.a);
+  ctx.fillStyle='#1c1c1c'; ctx.fillRect(-14,-13,28,6); ctx.fillRect(-14,7,28,6);
+  ctx.fillStyle=col.c; ctx.fillRect(-12,-9,24,18); ctx.fillStyle=col.d; ctx.fillRect(-12,-9,6,18);
   ctx.restore();
-  ctx.save(); ctx.translate(t.x,t.y); ctx.rotate(t.ta);
-  ctx.fillStyle='#eceff1'; ctx.fillRect(0,-2,20,4);                                     // barrel
-  ctx.fillStyle=col; ctx.beginPath(); ctx.arc(0,0,7,0,6.28); ctx.fill();
-  ctx.strokeStyle='#000'; ctx.lineWidth=1; ctx.stroke();
+  ctx.save(); ctx.translate(x,y); ctx.rotate(t.ta);
+  ctx.fillStyle=t.eq.cannon?'#ffe082':'#eceff1'; ctx.fillRect(0,t.eq.cannon?-3:-2,t.eq.cannon?24:20,t.eq.cannon?6:4);
+  ctx.fillStyle=col.c; ctx.beginPath(); ctx.arc(0,0,7,0,6.28); ctx.fill(); ctx.strokeStyle='#000'; ctx.stroke();
   ctx.restore();
-  // rank pips + hp bar
-  ctx.fillStyle='#000a'; ctx.fillRect(t.x-16,t.y-26,32,4);
-  ctx.fillStyle=t.isPlayer?'#66bb6a':'#ef5350'; ctx.fillRect(t.x-16,t.y-26,32*t.hp/t.max,4);
+  if(t.eq.shield>0){ ctx.strokeStyle=`rgba(120,220,255,${.3+t.eq.shield/120})`; ctx.lineWidth=2; ctx.beginPath(); ctx.arc(x,y,19,0,6.28); ctx.stroke(); ctx.lineWidth=1; }
+  const mf=stats(t.rank).maxFuel;
+  ctx.fillStyle='#000a'; ctx.fillRect(x-16,y-27,32,4); ctx.fillStyle='#ffca28'; ctx.fillRect(x-16,y-27,32*Math.max(0,t.fuel)/mf,4);
   ctx.fillStyle='#fff'; ctx.font='10px sans-serif'; ctx.textAlign='center';
-  ctx.fillText(t.isPlayer?'YOU':RANKS[t.rank].replace('General','Gen.').replace('Lieutenant','Lt.').replace('Brigadier','Brig.'),t.x,t.y-30);
+  ctx.fillText(`${t.isPlayer?'YOU':t.name} · ${short(t.rank)}`,x,y-31);
+}
+function drawPickup(k){
+  const near=Math.hypot(k.x-player.x,k.y-player.y)<120, seen=k.rev>frame;
+  if(!near&&!seen) return;
+  const x=k.x-camX,y=k.y-camY, a=seen&&!near?Math.min(1,(k.rev-frame)/60):1;
+  ctx.globalAlpha=a;
+  if(k.type==='fuel'){ ctx.fillStyle='#ef6c00'; ctx.fillRect(x-7,y-9,14,18); ctx.fillStyle='#ffb74d'; ctx.fillRect(x-4,y-12,8,4); ctx.fillStyle='#fff'; ctx.fillRect(x-3,y-3,6,6); }
+  else { ctx.fillStyle={cannon:'#fbc02d',shield:'#29b6f6',radar:'#ab47bc'}[k.type]; ctx.fillRect(x-9,y-9,18,18); ctx.fillStyle='#000'; ctx.font='bold 12px sans-serif'; ctx.textAlign='center'; ctx.fillText({cannon:'C',shield:'S',radar:'R'}[k.type],x,y+4); }
+  ctx.globalAlpha=1;
 }
 function draw(){
-  for(let j=0;j<ROWS;j++)for(let i=0;i<COLS;i++) drawTile(grid[j][i],i,j);
+  const i0=Math.max(0,camX/T|0),i1=Math.min(COLS-1,(camX+VW)/T|0),j0=Math.max(0,camY/T|0),j1=Math.min(ROWS-1,(camY+VH)/T|0);
+  for(let j=j0;j<=j1;j++)for(let i=i0;i<=i1;i++) drawTile(grid[j][i],i,j);
+  for(const f of ferries){ const x=f.x-camX,y=f.y-camY; ctx.fillStyle='#8d6e4a'; ctx.fillRect(x,y,f.w,f.h); ctx.strokeStyle='#5d4630'; ctx.lineWidth=2; ctx.strokeRect(x+2,y+2,f.w-4,f.h-4); for(let k=1;k<4;k++){ctx.beginPath();ctx.moveTo(x+k*16,y+2);ctx.lineTo(x+k*16,y+f.h-2);ctx.stroke();} ctx.lineWidth=1; }
+  for(const c of crates){ const x=c.x-camX-14,y=c.y-camY-14; ctx.fillStyle='#a1783f'; ctx.fillRect(x,y,28,28); ctx.strokeStyle='#5c4220'; ctx.strokeRect(x+1,y+1,26,26); ctx.beginPath(); ctx.moveTo(x,y);ctx.lineTo(x+28,y+28);ctx.moveTo(x+28,y);ctx.lineTo(x,y+28);ctx.stroke(); }
+  pickups.forEach(drawPickup);
+  for(const m of mines){ if(m.team!==player.team&&m.rev<=frame) continue; const x=m.x-camX,y=m.y-camY;
+    ctx.fillStyle=m.team===player.team?'#263238':'#b71c1c'; ctx.beginPath(); ctx.arc(x,y,7,0,6.28); ctx.fill(); ctx.strokeStyle=TEAM[m.team].c; ctx.stroke(); }
   tanks.forEach(drawTank);
-  ctx.fillStyle='#ffd54f'; for(const b of bullets){ctx.beginPath();ctx.arc(b.x,b.y,3,0,6.28);ctx.fill();}
-  ctx.fillStyle='#ffab40'; for(const p of particles){ctx.globalAlpha=p.l/40;ctx.fillRect(p.x,p.y,3,3);} ctx.globalAlpha=1;
-  // HUD
-  const r=player.rank, next=r<MAXR?xpNeeded(r+1):player.xp, base=xpNeeded(r);
-  ctx.fillStyle='#000a'; ctx.fillRect(8,8,260,44);
+  for(const b of bullets){ ctx.fillStyle=b.big?'#ff7043':'#ffee58'; ctx.beginPath(); ctx.arc(b.x-camX,b.y-camY,b.big?4.5:3,0,6.28); ctx.fill(); }
+  ctx.fillStyle='#ffab40'; for(const q of parts){ctx.globalAlpha=Math.min(1,q.l/30);ctx.fillRect(q.x-camX,q.y-camY,3,3);} ctx.globalAlpha=1;
+  for(const r of rings){ if(r.team!==player.team) continue; ctx.strokeStyle=`rgba(120,255,160,${1-r.r/r.R})`; ctx.beginPath(); ctx.arc(r.x-camX,r.y-camY,r.r,0,6.28); ctx.stroke(); }
+  if(player.dest&&player.alive){ ctx.strokeStyle='#fff8'; ctx.beginPath(); ctx.arc(player.dest.x-camX,player.dest.y-camY,6,0,6.28); ctx.stroke(); }
+  drawHud();
+  if(teleOpen) drawTele();
+  if(keys.tab) drawBoard();
+}
+function drawHud(){
+  const p=player, r=p.rank, mf=stats(r).maxFuel;
+  ctx.fillStyle='#000b'; ctx.fillRect(8,8,290,78);
   ctx.fillStyle='#fff'; ctx.font='bold 13px sans-serif'; ctx.textAlign='left';
-  ctx.fillText(`${RANKS[r]}   Kills: ${kills}`,16,25);
-  ctx.fillStyle='#37474f'; ctx.fillRect(16,32,244,10);
-  ctx.fillStyle='#ffca28'; ctx.fillRect(16,32,244*(r<MAXR?(player.xp-base)/(next-base):1),10);
-  if(msgT>0){ ctx.globalAlpha=Math.min(1,msgT/40); ctx.fillStyle='#fff'; ctx.font='bold 22px sans-serif'; ctx.textAlign='center'; ctx.fillText(msg,480,60); ctx.globalAlpha=1; }
-  if(!player.alive){ ctx.fillStyle='#fff'; ctx.font='bold 28px sans-serif'; ctx.textAlign='center'; ctx.fillText('Destroyed - respawning...',480,320); }
-  document.getElementById('stat').textContent = `${mapName} · ${tanks.filter(t=>t.alive&&!t.isPlayer).length} bots alive`;
+  ctx.fillText(`${p.name} — ${RANKS[r]}`,16,26);
+  ctx.font='11px sans-serif'; ctx.fillText('FUEL',16,43); ctx.fillText('XP',16,60);
+  ctx.fillStyle='#37474f'; ctx.fillRect(48,35,240,9); ctx.fillRect(48,52,240,9);
+  ctx.fillStyle=p.fuel<mf*.25?'#ef5350':'#ffb300'; ctx.fillRect(48,35,240*Math.max(0,p.fuel)/mf,9);
+  const base=xpNeeded(r),next=r<MAXR?xpNeeded(r+1):base+1;
+  ctx.fillStyle='#66bb6a'; ctx.fillRect(48,52,240*(r<MAXR?(p.xp-base)/(next-base):1),9);
+  ctx.fillStyle='#fff'; ctx.fillText(`Kills ${p.kills}  Deaths ${p.deaths}   [${p.eq.cannon?'CANNON ':''}${p.eq.shield>0?'SHIELD '+Math.ceil(p.eq.shield)+' ':''}${p.eq.radar?'LONG-RADAR':''}]`,16,79);
+  ctx.fillStyle='#000b'; ctx.fillRect(VW/2-90,8,180,24); ctx.textAlign='center'; ctx.font='bold 15px sans-serif';
+  ctx.fillStyle=TEAM.red.c; ctx.fillText(`RED ${score.red}`,VW/2-45,26); ctx.fillStyle=TEAM.blue.c; ctx.fillText(`${score.blue} BLUE`,VW/2+45,26);
+  // minimap
+  const mw=180,mh=120,mx=VW-mw-8,my=8; ctx.fillStyle='#000b'; ctx.fillRect(mx-2,my-2,mw+4,mh+4);
+  const sx=mw/COLS,sy=mh/ROWS;
+  for(let j=0;j<ROWS;j++)for(let i=0;i<COLS;i++){ const c=grid[j][i]; if(c==='.')continue; ctx.fillStyle=c==='#'?'#78909c':c==='B'?'#a0522d':'#1b5a85'; ctx.fillRect(mx+i*sx,my+j*sy,sx+.5,sy+.5); }
+  for(const t of tanks){ if(!t.alive||t.team!==p.team) continue; ctx.fillStyle=t.isPlayer?'#fff':TEAM[t.team].c; ctx.fillRect(mx+t.x/T*sx-1.5,my+t.y/T*sy-1.5,3,3); }
+  ctx.strokeStyle='#fff6'; ctx.strokeRect(mx+camX/T*sx,my+camY/T*sy,VW/T*sx,VH/T*sy);
+  // messages
+  ctx.textAlign='center'; ctx.font='bold 15px sans-serif';
+  msgs.forEach((m,i)=>{ ctx.globalAlpha=Math.min(1,m.l/40); ctx.fillStyle='#000a'; const w=ctx.measureText(m.t).width+16; ctx.fillRect(VW/2-w/2,44+i*22,w,20); ctx.fillStyle=m.c; ctx.fillText(m.t,VW/2,59+i*22); });
+  ctx.globalAlpha=1;
+  ctx.textAlign='left'; ctx.font='11px sans-serif'; ctx.fillStyle='#fffa';
+  ctx.fillText(`[M] mine  [R] radar${p.rc>0?' ('+Math.ceil(p.rc/60)+'s)':''}  [T] teleport${p.tp>0?' ('+Math.ceil(p.tp/60)+'s)':''}  [Tab] scoreboard`,12,VH-10);
+  if(!p.alive){ ctx.fillStyle='#000a'; ctx.fillRect(0,VH/2-40,VW,80); ctx.fillStyle='#fff'; ctx.font='bold 28px sans-serif'; ctx.textAlign='center'; ctx.fillText(`Deactivated — respawn in ${Math.ceil(p.respawn/60)}s`,VW/2,VH/2+10); }
+}
+function drawTele(){
+  ctx.fillStyle='#000d'; ctx.fillRect(0,0,VW,VH);
+  const s=VW/(COLS*T), oy=(VH-ROWS*T*s)/2;
+  for(let j=0;j<ROWS;j++)for(let i=0;i<COLS;i++){ const c=grid[j][i]; ctx.fillStyle=c==='#'?'#78909c':c==='B'?'#a0522d':c==='W'?'#1b5a85':'#2a3a2a'; ctx.fillRect(i*T*s,oy+j*T*s,T*s,T*s); }
+  for(const t of tanks){ if(!t.alive||t.team!==player.team) continue; ctx.fillStyle=t.isPlayer?'#fff':TEAM[t.team].c; ctx.beginPath(); ctx.arc(t.x*s,oy+t.y*s,4,0,6.28); ctx.fill(); }
+  ctx.fillStyle='#fff'; ctx.font='bold 18px sans-serif'; ctx.textAlign='center';
+  ctx.fillText(player.tp>0?'Teleport recharging…':'TELEPORT — click a clear spot (costs 25 fuel). Esc to cancel',VW/2,28);
+}
+function drawBoard(){
+  ctx.fillStyle='#000d'; ctx.fillRect(180,60,600,500); ctx.font='bold 14px sans-serif'; ctx.textAlign='left'; ctx.fillStyle='#ffca28';
+  ctx.fillText('SCOREBOARD',200,86);
+  const list=[...tanks].sort((a,b)=>b.kills-a.kills||b.xp-a.xp); ctx.font='12px sans-serif';
+  list.slice(0,24).forEach((t,i)=>{ const y=108+i*19; ctx.fillStyle=TEAM[t.team].c; ctx.fillText(`${t.isPlayer?t.name+' (you)':t.name}`,200,y); ctx.fillStyle='#fff'; ctx.fillText(RANKS[t.rank],360,y); ctx.fillText(`K ${t.kills}`,580,y); ctx.fillText(`D ${t.deaths}`,640,y); ctx.fillStyle=t.alive?'#8bc34a':'#ef5350'; ctx.fillText(t.alive?'active':'down',700,y); });
 }
 
-// ---------- Input & loop ----------
-addEventListener('keydown',e=>{keys[e.key.toLowerCase()]=true; if([' ','arrowup','arrowdown'].includes(e.key.toLowerCase()))e.preventDefault();});
-addEventListener('keyup',e=>keys[e.key.toLowerCase()]=false);
-cv.addEventListener('mousemove',e=>{const r=cv.getBoundingClientRect();mouse.x=(e.clientX-r.left)*cv.width/r.width;mouse.y=(e.clientY-r.top)*cv.height/r.height;});
-cv.addEventListener('mousedown',()=>mouse.down=true);
-addEventListener('mouseup',()=>mouse.down=false);
+// ---------- Persistence & lobby ----------
+const store = { get(){ try{return JSON.parse(localStorage.getItem('tankarena.tanks')||'{}');}catch(e){return {};} },
+                set(v){ try{localStorage.setItem('tankarena.tanks',JSON.stringify(v));}catch(e){} } };
+function save(){ if(!player) return; const s=store.get(); const o=s[player.name]||{}; s[player.name]={xp:Math.floor(player.xp),kills:(o.kills||0)+0,rank:player.rank,team:player.team}; s[player.name].kills=Math.max(o.kills||0,player.kills); store.set(s); }
+function renderTanks(){
+  const s=store.get(), box=document.getElementById('tanks'); box.innerHTML='';
+  const names=Object.keys(s); if(!names.length){ box.innerHTML='<div style="opacity:.6">No saved tanks yet — enter a name and deploy.</div>'; return; }
+  names.forEach(n=>{ const d=document.createElement('div'); d.innerHTML=`<span>${n.replace(/</g,'&lt;')}</span><span>${RANKS[rankOf(s[n].xp)]} · ${s[n].xp} XP</span>`; d.onclick=()=>{document.getElementById('name').value=n;}; box.appendChild(d); });
+}
+const mapSel=document.getElementById('mapSel'); Object.keys(MAPS).forEach(n=>mapSel.add(new Option(n,n)));
+document.getElementById('deploy').onclick=()=>{
+  const name=(document.getElementById('name').value.trim()||'Recruit01').slice(0,14), team=document.getElementById('teamSel').value;
+  start(mapSel.value,name,team); document.getElementById('lobby').style.display='none'; running=true;
+};
+document.getElementById('menuBtn').onclick=()=>{ if(player) save(); running=false; renderTanks(); document.getElementById('lobby').style.display='flex'; };
 
-start("Crossroads");
-(function loop(){ update(); draw(); requestAnimationFrame(loop); })();
+function start(map,name,team){
+  mapName=map; buildMap(map); frame=0; bullets=[]; parts=[]; rings=[]; mines=[]; pickups=[]; tanks=[]; msgs=[]; score={red:0,blue:0}; teleOpen=false;
+  const saved=store.get()[name], xp=saved?saved.xp:0;
+  player=makeTank(name,team,rankOf(xp),true,xp); player.stuck=0; tanks.push(player);
+  // 12 bots per side; ranks are spread evenly Recruit..General and shuffled so they're scattered across the field
+  const other=team==='red'?'blue':'red', used=new Set([name]);
+  const callsign=()=>{ let n,k=0; do{ n=CALLS[Math.random()*CALLS.length|0]+(k++>20?(Math.random()*99|0):''); }while(used.has(n)); used.add(n); return n; };
+  for(const tm of [team,other]){
+    const n=tm===team?11:12, ranks=[]; for(let i=0;i<n;i++) ranks.push(Math.round(i*MAXR/(n-1)));
+    ranks.sort(()=>Math.random()-.5);
+    ranks.forEach(r=>tanks.push(makeTank(callsign(),tm,r,false)));
+  }
+  for(let i=0;i<22;i++){ const s=freeSpot(); pickups.push({x:s.x,y:s.y,type:'fuel',rev:0}); }
+  ['cannon','shield','radar','cannon','shield'].forEach(t=>{ const s=freeSpot(); pickups.push({x:s.x,y:s.y,type:t,rev:0}); });
+  camX=camY=0; say(`Deployed on ${map} — Team ${team.toUpperCase()}`,'#ffca28');
+}
+
+// ---------- Input ----------
+addEventListener('keydown',e=>{
+  const k=e.key.toLowerCase(); if(!running) return; keys[k]=true;
+  if([' ','arrowup','arrowdown','arrowleft','arrowright','tab'].includes(k)) e.preventDefault();
+  if(!player.alive) return;
+  if(k==='m') layMine(player); else if(k==='r') radar(player);
+  else if(k==='t'){ if(player.tp>0) say('Teleporter recharging'); else teleOpen=!teleOpen; }
+  else if(k==='escape') teleOpen=false;
+});
+addEventListener('keyup',e=>keys[e.key.toLowerCase()]=false);
+function mpos(e){ const r=cv.getBoundingClientRect(); mouse.x=(e.clientX-r.left)*cv.width/r.width; mouse.y=(e.clientY-r.top)*cv.height/r.height; }
+cv.addEventListener('mousemove',mpos);
+cv.addEventListener('contextmenu',e=>e.preventDefault());
+cv.addEventListener('mousedown',e=>{
+  mpos(e); if(!running||!player.alive) return;
+  if(e.button===2){ mouse.rdown=true; return; }
+  if(teleOpen){
+    const s=VW/(COLS*T), oy=(VH-ROWS*T*s)/2, x=mouse.x/s, y=(mouse.y-oy)/s;
+    if(!hitsWall(x,y,14)&&!onFerry(x,y)&&!crateAt(x,y,null,30)&&!tankNear(x,y,player,40)&&player.fuel>30){
+      player.x=x; player.y=y; player.tp=420; player.dest=null; useFuel(player,25,null); boom(x,y,24); teleOpen=false;
+    } else say('Cannot teleport there','#ef9a9a');
+    return;
+  }
+  player.dest={x:mouse.x+camX,y:mouse.y+camY}; player.stuck=0;
+});
+addEventListener('mouseup',e=>{ if(e.button===2) mouse.rdown=false; });
+
+renderTanks();
+// idle backdrop behind the lobby
+start("Iron Valley","Recruit01","red");
+(function loop(){ if(running) update(); draw(); requestAnimationFrame(loop); })();
 </script>
 </body>
 </html>
